@@ -20,6 +20,10 @@ class DiagonalGaussianDistribution:
     def mode(self):
         return self.mean
 
+    @property
+    def shape(self):
+        return self.mean.shape
+
     def to(self, *args, **kwargs):
         self.moments = self.moments.to(*args, **kwargs)
         self.mean = self.mean.to(*args, **kwargs)
