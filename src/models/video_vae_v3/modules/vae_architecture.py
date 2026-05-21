@@ -260,15 +260,18 @@ class VideoAutoencoderKL(nn.Module):
         self.encoder = Encoder3D(in_channels=in_channels, block_out_channels=block_out_channels, latent_channels=latent_channels, norm_num_groups=norm_num_groups, operations=operations)
         self.decoder = Decoder3D(out_channels=out_channels, block_out_channels=block_out_channels, latent_channels=latent_channels, norm_num_groups=norm_num_groups, temporal_scale_num=temporal_scale_num, operations=operations)
 
-    def encode(self, x, **kwargs):
+    def encode_distribution(self, x, **kwargs):
         return DiagonalGaussianDistribution(self.encoder(x))
+
+    def encode(self, x, sample_posterior=False, generator=None, **kwargs):
+        posterior = self.encode_distribution(x, **kwargs)
+        return posterior.sample(generator=generator) if sample_posterior else posterior.mode()
 
     def decode(self, z, **kwargs):
         return self.decoder(z)
 
     def forward(self, sample, sample_posterior=False, generator=None, **kwargs):
-        posterior = self.encode(sample)
-        z = posterior.sample(generator=generator) if sample_posterior else posterior.mode()
+        z = self.encode(sample, sample_posterior=sample_posterior, generator=generator, **kwargs)
         return self.decode(z)
 
 
