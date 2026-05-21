@@ -1,93 +1,24 @@
-"""Torch-native consolidated Video VAE architecture.
-
-This module intentionally avoids relative imports, diffusers, memory/offload helpers,
-and runtime-specific backends.
-"""
 from __future__ import annotations
-from typing import Optional, Tuple, Union
+
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 class DiagonalGaussianDistribution:
     def __init__(self, moments: torch.Tensor):
         self.moments = moments
         self.mean, self.logvar = torch.chunk(moments, 2, dim=1)
         self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
-        self.std = torch.exp(0.5*self.logvar)
+        self.std = torch.exp(0.5 * self.logvar)
+
     def sample(self, generator=None):
-        eps = torch.randn(
-            self.mean.shape,
-            generator=generator,
-            device=self.mean.device,
-            dtype=self.mean.dtype,
-        )
+        eps = torch.randn(self.mean.shape, generator=generator, device=self.mean.device, dtype=self.mean.dtype)
         return self.mean + self.std * eps
+
     def mode(self):
         return self.mean
-
-def remove_head(x: torch.Tensor) -> torch.Tensor:
-    return x[:, :, 1:] if x.shape[2] > 1 else x
-
-def causal_norm_wrapper(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    if x.ndim == 5:
-        b,c,t,h,w = x.shape
-        y = x.permute(0,2,1,3,4).reshape(b*t,c,h,w)
-        y = norm(y)
-        return y.reshape(b,t,c,h,w).permute(0,2,1,3,4)
-    return norm(x)
-
-class InflatedCausalConv3d(nn.Module):
-    def __init__(self, *args, inflation_mode: str='tail', operations=None, **kwargs):
-        super().__init__()
-        operations = operations or nn
-        padding = kwargs.pop("padding", 0)
-        if isinstance(padding, int):
-            padding = (padding, padding, padding)
-        self.temporal_padding = int(padding[0])
-        self.spatial_padding = (int(padding[1]), int(padding[2]))
-        kwargs["padding"] = (0, self.spatial_padding[0], self.spatial_padding[1])
-        self.conv = operations.Conv3d(*args, **kwargs)
-        self.inflation_mode = inflation_mode
-    @property
-    def weight(self):
-        return self.conv.weight
-    @property
-    def bias(self):
-        return self.conv.bias
-    def forward(self, x: torch.Tensor):
-        if self.temporal_padding > 0:
-            head = x[:, :, :1].repeat(1, 1, self.temporal_padding, 1, 1)
-            x = torch.cat([head, x], dim=2)
-        return self.conv(x)
-
-def init_causal_conv3d(*args, inflation_mode='tail', operations=None, **kwargs):
-    return InflatedCausalConv3d(*args, inflation_mode=inflation_mode, operations=operations, **kwargs)
-
-class Upsample3D(nn.Module):
-    def __init__(self, channels: int, out_channels: int, temporal_up=False, spatial_up=True, operations=None, **kwargs):
-        super().__init__()
-        operations = operations or nn
-        self.channels = channels
-        self.out_channels = out_channels
-        self.temporal_ratio = 2 if temporal_up else 1
-        self.spatial_ratio = 2 if spatial_up else 1
-        self.conv = init_causal_conv3d(channels, out_channels, 3, padding=1, operations=operations)
-    def forward(self, x, output_size=None, **kwargs):
-        x = F.interpolate(x, scale_factor=(self.temporal_ratio,self.spatial_ratio,self.spatial_ratio), mode='nearest')
-        return self.conv(x)
-
-class Downsample3D(nn.Module):
-    def __init__(self, channels: int, out_channels: int, temporal_down=False, spatial_down=True, operations=None, **kwargs):
-        super().__init__()
-        self.channels=channels
-        self.out_channels=out_channels
-        tr = 2 if temporal_down else 1
-        sr = 2 if spatial_down else 1
-        self.conv = init_causal_conv3d(channels, out_channels, kernel_size=(3 if temporal_down else 1,3 if spatial_down else 1,3 if spatial_down else 1), stride=(tr,sr,sr), padding=(1 if temporal_down else 0,1 if spatial_down else 0,1 if spatial_down else 0), operations=operations)
-    def forward(self, x, **kwargs):
-        return self.conv(x)
 
 
 def _resolve_groups(num_channels: int, groups: int) -> int:
@@ -96,191 +27,234 @@ def _resolve_groups(num_channels: int, groups: int) -> int:
         return groups
     return math.gcd(num_channels, groups) or 1
 
+
+def causal_norm_wrapper(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    b, c, t, h, w = x.shape
+    y = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+    y = norm(y)
+    return y.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+
+
+_INFLATED_CONV_CLASS_CACHE = {}
+
+
+def _inflated_conv_class(base_conv3d):
+    cached = _INFLATED_CONV_CLASS_CACHE.get(base_conv3d)
+    if cached is not None:
+        return cached
+
+    class InflatedCausalConv3d(base_conv3d):
+        def __init__(self, *args, **kwargs):
+            padding = kwargs.pop("padding", 0)
+            if isinstance(padding, int):
+                padding = (padding, padding, padding)
+            self.temporal_padding = int(padding[0])
+            super().__init__(*args, padding=(0, int(padding[1]), int(padding[2])), **kwargs)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            if self.temporal_padding > 0:
+                head = x[:, :, :1].repeat(1, 1, self.temporal_padding, 1, 1)
+                x = torch.cat([head, x], dim=2)
+            return super().forward(x)
+
+    _INFLATED_CONV_CLASS_CACHE[base_conv3d] = InflatedCausalConv3d
+    return InflatedCausalConv3d
+
+
+class InflatedCausalConv3d(_inflated_conv_class(nn.Conv3d)):
+    """Default torch Conv3d-based causal conv class."""
+
+
+def init_causal_conv3d(*args, operations=None, **kwargs):
+    operations = operations or nn
+    base_conv3d = operations.Conv3d
+    conv_cls = _inflated_conv_class(base_conv3d)
+    return conv_cls(*args, **kwargs)
+
+
+class Upsample3D(nn.Module):
+    def __init__(self, channels: int, operations=None):
+        super().__init__()
+        self.conv = init_causal_conv3d(channels, channels, 3, padding=1, operations=operations)
+        self.upscale_conv = init_causal_conv3d(channels, channels * 8, 1, padding=0, operations=operations)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.upscale_conv(x)
+        b, c, t, h, w = x.shape
+        x = x.view(b, c // 8, 2, 2, 2, t, h, w).permute(0, 1, 5, 2, 6, 3, 7, 4).reshape(b, c // 8, t * 2, h * 2, w * 2)
+        return x
+
+
+class Downsample3D(nn.Module):
+    def __init__(self, channels: int, first: bool = False, operations=None):
+        super().__init__()
+        kernel = (1, 3, 3) if first else (3, 3, 3)
+        padding = (0, 1, 1) if first else (1, 1, 1)
+        self.conv = init_causal_conv3d(channels, channels, kernel_size=kernel, stride=(1, 2, 2), padding=padding, operations=operations)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
 class ResnetBlock3D(nn.Module):
-    def __init__(self, in_channels, out_channels=None, groups=32, operations=None, act_fn: str = "silu", **kwargs):
+    def __init__(self, in_channels, out_channels, groups=32, act_fn="silu", operations=None):
         super().__init__()
         operations = operations or nn
-        out_channels = out_channels or in_channels
         self.norm1 = operations.GroupNorm(_resolve_groups(in_channels, groups), in_channels)
         self.conv1 = init_causal_conv3d(in_channels, out_channels, 3, padding=1, operations=operations)
         self.norm2 = operations.GroupNorm(_resolve_groups(out_channels, groups), out_channels)
         self.conv2 = init_causal_conv3d(out_channels, out_channels, 3, padding=1, operations=operations)
-        self.nin_shortcut = init_causal_conv3d(in_channels, out_channels, 1, operations=operations) if in_channels != out_channels else None
+        self.conv_shortcut = init_causal_conv3d(in_channels, out_channels, 1, padding=0, operations=operations) if in_channels != out_channels else None
         self.act_fn = act_fn
 
     def _act(self, x):
-        if self.act_fn == "silu":
-            return F.silu(x)
-        if self.act_fn == "relu":
-            return F.relu(x)
-        raise ValueError(f"Unsupported act_fn: {self.act_fn}")
+        return F.silu(x) if self.act_fn == "silu" else F.relu(x)
 
-    def forward(self, x, temb=None):
+    def forward(self, x):
         h = self.conv1(self._act(causal_norm_wrapper(self.norm1, x)))
         h = self.conv2(self._act(causal_norm_wrapper(self.norm2, h)))
-        x = self.nin_shortcut(x) if self.nin_shortcut is not None else x
+        if self.conv_shortcut is not None:
+            x = self.conv_shortcut(x)
         return x + h
 
 
-class DownEncoderBlock3D(nn.Module):
-    def __init__(self, in_channels, out_channels, layers_per_block=1, add_downsample=True, operations=None, norm_num_groups=32, act_fn="silu", inflation_mode="tail", **kwargs):
+class Attention3D(nn.Module):
+    def __init__(self, channels, groups=32, operations=None):
         super().__init__()
-        self.resnets = nn.ModuleList()
-        prev = in_channels
-        for _ in range(layers_per_block):
-            self.resnets.append(ResnetBlock3D(prev, out_channels, groups=norm_num_groups, operations=operations, act_fn=act_fn))
-            prev = out_channels
-        self.downsampler = Downsample3D(out_channels, out_channels, temporal_down=False, spatial_down=True, operations=operations) if add_downsample else None
+        operations = operations or nn
+        self.group_norm = operations.GroupNorm(_resolve_groups(channels, groups), channels)
+        self.to_q = operations.Linear(channels, channels)
+        self.to_k = operations.Linear(channels, channels)
+        self.to_v = operations.Linear(channels, channels)
+        self.to_out = nn.ModuleList([operations.Linear(channels, channels)])
 
-    def forward(self, hidden_states):
-        for resnet in self.resnets:
-            hidden_states = resnet(hidden_states)
-        if self.downsampler is not None:
-            hidden_states = self.downsampler(hidden_states)
-        return hidden_states
+    def forward(self, x):
+        b, c, t, h, w = x.shape
+        y = causal_norm_wrapper(self.group_norm, x).permute(0, 2, 3, 4, 1).reshape(b, t * h * w, c)
+        q, k, v = self.to_q(y), self.to_k(y), self.to_v(y)
+        a = torch.softmax(torch.bmm(q, k.transpose(1, 2)) / math.sqrt(c), dim=-1)
+        y = self.to_out[0](torch.bmm(a, v)).reshape(b, t, h, w, c).permute(0, 4, 1, 2, 3)
+        return x + y
+
+
+class UNetMidBlock3D(nn.Module):
+    def __init__(self, channels, groups=32, operations=None):
+        super().__init__()
+        self.resnets = nn.ModuleList([
+            ResnetBlock3D(channels, channels, groups=groups, operations=operations),
+            ResnetBlock3D(channels, channels, groups=groups, operations=operations),
+        ])
+        self.attentions = nn.ModuleList([Attention3D(channels, groups=groups, operations=operations)])
+
+    def forward(self, x):
+        x = self.resnets[0](x)
+        x = self.attentions[0](x)
+        x = self.resnets[1](x)
+        return x
+
+
+class DownEncoderBlock3D(nn.Module):
+    def __init__(self, in_channels, out_channels, add_downsample=True, first=False, groups=32, operations=None):
+        super().__init__()
+        self.resnets = nn.ModuleList([
+            ResnetBlock3D(in_channels, out_channels, groups=groups, operations=operations),
+            ResnetBlock3D(out_channels, out_channels, groups=groups, operations=operations),
+        ])
+        self.downsamplers = nn.ModuleList([Downsample3D(out_channels, first=first, operations=operations)]) if add_downsample else nn.ModuleList([])
+
+    def forward(self, x):
+        for r in self.resnets:
+            x = r(x)
+        for d in self.downsamplers:
+            x = d(x)
+        return x
 
 
 class UpDecoderBlock3D(nn.Module):
-    def __init__(self, in_channels, out_channels, layers_per_block=1, add_upsample=True, operations=None, norm_num_groups=32, act_fn="silu", inflation_mode="tail", **kwargs):
+    def __init__(self, in_channels, out_channels, add_upsample=True, groups=32, operations=None):
         super().__init__()
-        self.resnets = nn.ModuleList()
-        prev = in_channels
-        for _ in range(layers_per_block):
-            self.resnets.append(ResnetBlock3D(prev, out_channels, groups=norm_num_groups, operations=operations, act_fn=act_fn))
-            prev = out_channels
-        self.upsampler = Upsample3D(out_channels, out_channels, temporal_up=False, spatial_up=True, operations=operations) if add_upsample else None
+        self.resnets = nn.ModuleList([
+            ResnetBlock3D(in_channels, out_channels, groups=groups, operations=operations),
+            ResnetBlock3D(out_channels, out_channels, groups=groups, operations=operations),
+            ResnetBlock3D(out_channels, out_channels, groups=groups, operations=operations),
+        ])
+        self.upsamplers = nn.ModuleList([Upsample3D(out_channels, operations=operations)]) if add_upsample else nn.ModuleList([])
 
-    def forward(self, hidden_states):
-        for resnet in self.resnets:
-            hidden_states = resnet(hidden_states)
-        if self.upsampler is not None:
-            hidden_states = self.upsampler(hidden_states)
-        return hidden_states
+    def forward(self, x):
+        for r in self.resnets:
+            x = r(x)
+        for u in self.upsamplers:
+            x = u(x)
+        return x
+
 
 class Encoder3D(nn.Module):
-    def __init__(self, in_channels=3, block_out_channels=(8,), layers_per_block=1, latent_channels=4, operations=None, norm_num_groups=32, act_fn: str = "silu", inflation_mode: str = "tail", **kwargs):
+    def __init__(self, in_channels=3, block_out_channels=(128, 256, 512, 512), latent_channels=16, norm_num_groups=32, operations=None):
         super().__init__()
         operations = operations or nn
-        if len(block_out_channels) == 0:
-            raise ValueError("block_out_channels must be non-empty")
-        first = block_out_channels[0]
-        self.layers_per_block = layers_per_block
-        self.conv_in = init_causal_conv3d(in_channels, first, 3, padding=1, operations=operations, inflation_mode=inflation_mode)
-        blocks = []
-        prev = first
-        for i, ch in enumerate(block_out_channels):
-            add_downsample = i < len(block_out_channels) - 1
-            block = DownEncoderBlock3D(prev, ch, layers_per_block=layers_per_block, add_downsample=add_downsample, operations=operations, norm_num_groups=norm_num_groups, act_fn=act_fn, inflation_mode=inflation_mode)
-            blocks.append(block)
-            prev = ch
-        self.blocks = nn.ModuleList(blocks)
-        self.conv_out = init_causal_conv3d(prev, latent_channels*2, 3, padding=1, operations=operations, inflation_mode=inflation_mode)
+        self.conv_in = init_causal_conv3d(in_channels, block_out_channels[0], 3, padding=1, operations=operations)
+        self.down_blocks = nn.ModuleList([
+            DownEncoderBlock3D(block_out_channels[0], block_out_channels[0], add_downsample=True, first=True, groups=norm_num_groups, operations=operations),
+            DownEncoderBlock3D(block_out_channels[0], block_out_channels[1], add_downsample=True, groups=norm_num_groups, operations=operations),
+            DownEncoderBlock3D(block_out_channels[1], block_out_channels[2], add_downsample=True, groups=norm_num_groups, operations=operations),
+            DownEncoderBlock3D(block_out_channels[2], block_out_channels[3], add_downsample=False, groups=norm_num_groups, operations=operations),
+        ])
+        self.mid_block = UNetMidBlock3D(block_out_channels[-1], groups=norm_num_groups, operations=operations)
+        self.conv_norm_out = operations.GroupNorm(_resolve_groups(block_out_channels[-1], norm_num_groups), block_out_channels[-1])
+        self.conv_out = init_causal_conv3d(block_out_channels[-1], latent_channels * 2, 3, padding=1, operations=operations)
 
     def forward(self, x):
         x = self.conv_in(x)
-        for block in self.blocks:
+        for block in self.down_blocks:
             x = block(x)
-        x = self.conv_out(x)
-        return x
+        x = self.mid_block(x)
+        x = F.silu(causal_norm_wrapper(self.conv_norm_out, x))
+        return self.conv_out(x)
+
 
 class Decoder3D(nn.Module):
-    def __init__(self, latent_channels=4, block_out_channels=(8,), layers_per_block=1, out_channels=3, operations=None, norm_num_groups=32, act_fn: str = "silu", inflation_mode: str = "tail", **kwargs):
+    def __init__(self, out_channels=3, block_out_channels=(128, 256, 512, 512), latent_channels=16, norm_num_groups=32, operations=None):
         super().__init__()
         operations = operations or nn
-        if len(block_out_channels) == 0:
-            raise ValueError("block_out_channels must be non-empty")
-        hidden_channels = block_out_channels[-1]
-        self.layers_per_block = layers_per_block
-        self.conv_in = init_causal_conv3d(latent_channels, hidden_channels, 3, padding=1, operations=operations, inflation_mode=inflation_mode)
-        blocks = []
-        prev = hidden_channels
+        self.conv_in = init_causal_conv3d(latent_channels, block_out_channels[-1], 3, padding=1, operations=operations)
+        self.mid_block = UNetMidBlock3D(block_out_channels[-1], groups=norm_num_groups, operations=operations)
         rev = list(reversed(block_out_channels))
-        for i, ch in enumerate(rev):
-            add_upsample = i < len(rev) - 1
-            block = UpDecoderBlock3D(prev, ch, layers_per_block=layers_per_block, add_upsample=add_upsample, operations=operations, norm_num_groups=norm_num_groups, act_fn=act_fn, inflation_mode=inflation_mode)
-            blocks.append(block)
-            prev = ch
-        self.blocks = nn.ModuleList(blocks)
-        self.conv_out = init_causal_conv3d(prev, out_channels, 3, padding=1, operations=operations, inflation_mode=inflation_mode)
+        self.up_blocks = nn.ModuleList([
+            UpDecoderBlock3D(rev[0], rev[0], add_upsample=True, groups=norm_num_groups, operations=operations),
+            UpDecoderBlock3D(rev[0], rev[1], add_upsample=True, groups=norm_num_groups, operations=operations),
+            UpDecoderBlock3D(rev[1], rev[2], add_upsample=True, groups=norm_num_groups, operations=operations),
+            UpDecoderBlock3D(rev[2], rev[3], add_upsample=False, groups=norm_num_groups, operations=operations),
+        ])
+        self.conv_norm_out = operations.GroupNorm(_resolve_groups(block_out_channels[0], norm_num_groups), block_out_channels[0])
+        self.conv_out = init_causal_conv3d(block_out_channels[0], out_channels, 3, padding=1, operations=operations)
 
     def forward(self, z):
-        h = self.conv_in(z)
-        for block in self.blocks:
-            h = block(h)
-        return self.conv_out(h)
+        z = self.conv_in(z)
+        z = self.mid_block(z)
+        for block in self.up_blocks:
+            z = block(z)
+        z = F.silu(causal_norm_wrapper(self.conv_norm_out, z))
+        return self.conv_out(z)
+
 
 class VideoAutoencoderKL(nn.Module):
-    def __init__(
-        self,
-        in_channels=3,
-        out_channels=3,
-        block_out_channels=(8,),
-        down_block_types=("DownEncoderBlock3D",),
-        up_block_types=("UpDecoderBlock3D",),
-        layers_per_block=1,
-        latent_channels=4,
-        norm_num_groups=32,
-        act_fn="silu",
-        inflation_mode="tail",
-        operations=None,
-        **kwargs,
-    ):
+    def __init__(self, in_channels=3, out_channels=3, block_out_channels=(128, 256, 512, 512), latent_channels=16, norm_num_groups=32, operations=None, **kwargs):
         super().__init__()
-        self.down_block_types = tuple(down_block_types)
-        self.up_block_types = tuple(up_block_types)
-        self.encoder = Encoder3D(
-            in_channels=in_channels,
-            block_out_channels=tuple(block_out_channels),
-            layers_per_block=layers_per_block,
-            latent_channels=latent_channels,
-            operations=operations,
-            norm_num_groups=norm_num_groups,
-            act_fn=act_fn,
-            inflation_mode=inflation_mode,
-        )
-        self.decoder = Decoder3D(
-            latent_channels=latent_channels,
-            block_out_channels=tuple(block_out_channels),
-            layers_per_block=layers_per_block,
-            out_channels=out_channels,
-            operations=operations,
-            norm_num_groups=norm_num_groups,
-            act_fn=act_fn,
-            inflation_mode=inflation_mode,
-        )
-        self.use_slicing = False
+        self.encoder = Encoder3D(in_channels=in_channels, block_out_channels=block_out_channels, latent_channels=latent_channels, norm_num_groups=norm_num_groups, operations=operations)
+        self.decoder = Decoder3D(out_channels=out_channels, block_out_channels=block_out_channels, latent_channels=latent_channels, norm_num_groups=norm_num_groups, operations=operations)
 
-    def enable_slicing(self):
-        self.use_slicing = True
-
-    def disable_slicing(self):
-        self.use_slicing = False
-
-    def slicing_encode(self, x, num_slices: int = 2):
-        if num_slices <= 1 or x.shape[2] < 2:
-            return self.encode(x)
-        parts = torch.chunk(x, num_slices, dim=2)
-        moments = [self.encoder(p) for p in parts]
-        return DiagonalGaussianDistribution(torch.cat(moments, dim=2))
-
-    def slicing_decode(self, z, num_slices: int = 2):
-        if num_slices <= 1 or z.shape[2] < 2:
-            return self.decode(z)
-        parts = torch.chunk(z, num_slices, dim=2)
-        decs = [self.decoder(p) for p in parts]
-        return torch.cat(decs, dim=2)
     def encode(self, x, **kwargs):
-        moments = self.encoder(x) if not self.use_slicing else self.slicing_encode(x, kwargs.get("num_slices", 2)).moments
-        posterior = DiagonalGaussianDistribution(moments)
-        return posterior
+        return DiagonalGaussianDistribution(self.encoder(x))
+
     def decode(self, z, **kwargs):
-        dec = self.decoder(z) if not self.use_slicing else self.slicing_decode(z, kwargs.get("num_slices", 2))
-        return dec
+        return self.decoder(z)
+
     def forward(self, sample, sample_posterior=False, generator=None, **kwargs):
         posterior = self.encode(sample)
         z = posterior.sample(generator=generator) if sample_posterior else posterior.mode()
-        dec = self.decode(z)
-        return dec
+        return self.decode(z)
+
 
 class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
     pass
