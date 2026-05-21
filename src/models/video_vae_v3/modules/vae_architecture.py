@@ -20,6 +20,13 @@ class DiagonalGaussianDistribution:
     def mode(self):
         return self.mean
 
+    def to(self, *args, **kwargs):
+        self.moments = self.moments.to(*args, **kwargs)
+        self.mean = self.mean.to(*args, **kwargs)
+        self.logvar = self.logvar.to(*args, **kwargs)
+        self.std = self.std.to(*args, **kwargs)
+        return self
+
 
 def _resolve_groups(num_channels: int, groups: int) -> int:
     groups = min(groups, num_channels)
