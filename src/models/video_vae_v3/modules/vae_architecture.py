@@ -48,7 +48,7 @@ def _inflated_conv_class(base_conv3d):
             padding = kwargs.pop("padding", 0)
             if isinstance(padding, int):
                 padding = (padding, padding, padding)
-            self.temporal_padding = int(padding[0])
+            self.temporal_padding = int(padding[0]) * 2
             super().__init__(*args, padding=(0, int(padding[1]), int(padding[2])), **kwargs)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
