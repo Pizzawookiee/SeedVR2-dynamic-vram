@@ -89,7 +89,14 @@ class Upsample3D(nn.Module):
         self.conv = init_causal_conv3d(channels, channels, 3, padding=1, operations=operations)
         self.temporal_up = temporal_up
         scale_mul = 8 if temporal_up else 4
-        self.upscale_conv = init_causal_conv3d(channels, channels * scale_mul, 1, padding=0, operations=operations)
+        self.upscale_conv = operations.Conv3d(channels, channels * scale_mul, 1, padding=0)
+        identity = (
+            torch.eye(channels)
+            .repeat(scale_mul, 1)
+            .reshape_as(self.upscale_conv.weight)
+        )
+        self.upscale_conv.weight.data.copy_(identity)
+        nn.init.zeros_(self.upscale_conv.bias)
 
     def forward(self, x):
         x = self.conv(x)
@@ -103,11 +110,21 @@ class Upsample3D(nn.Module):
 
 
 class Downsample3D(nn.Module):
-    def __init__(self, channels: int, first: bool = False, operations=None):
+    def __init__(self, channels: int, first: bool = False, temporal_down: bool = False, operations=None):
         super().__init__()
-        kernel = (1, 3, 3) if first else (3, 3, 3)
-        padding = (0, 1, 1) if first else (1, 1, 1)
-        self.conv = init_causal_conv3d(channels, channels, kernel_size=kernel, stride=(1, 2, 2), padding=padding, operations=operations)
+
+        temporal_kernel = 3 if temporal_down else 1
+        temporal_padding = 1 if temporal_down else 0
+
+        self.temporal_down = temporal_down
+        self.conv = init_causal_conv3d(
+            channels,
+            channels,
+            kernel_size=(temporal_kernel, 3, 3),
+            stride=(2 if temporal_down else 1, 2, 2),
+            padding=(temporal_padding, 1, 1),
+            operations=operations,
+        )
 
     def forward(self, x):
         return self.conv(x)
@@ -171,13 +188,15 @@ class UNetMidBlock3D(nn.Module):
 
 
 class DownEncoderBlock3D(nn.Module):
-    def __init__(self, in_channels, out_channels, add_downsample=True, first=False, groups=32, operations=None):
+    def __init__(self, in_channels, out_channels, add_downsample=True, first=False, temporal_down=False, groups=32, operations=None):
         super().__init__()
         self.resnets = nn.ModuleList([
             ResnetBlock3D(in_channels, out_channels, groups=groups, operations=operations),
             ResnetBlock3D(out_channels, out_channels, groups=groups, operations=operations),
         ])
-        self.downsamplers = nn.ModuleList([Downsample3D(out_channels, first=first, operations=operations)]) if add_downsample else nn.ModuleList([])
+        self.downsamplers = nn.ModuleList([
+            Downsample3D(out_channels, first=first, temporal_down=temporal_down, operations=operations)
+        ]) if add_downsample else nn.ModuleList([])
 
     def forward(self, x):
         for r in self.resnets:
@@ -206,15 +225,22 @@ class UpDecoderBlock3D(nn.Module):
 
 
 class Encoder3D(nn.Module):
-    def __init__(self, in_channels=3, block_out_channels=(128, 256, 512, 512), latent_channels=16, norm_num_groups=32, operations=None):
+    def __init__(self, in_channels=3, block_out_channels=(128, 256, 512, 512), latent_channels=16, norm_num_groups=32, temporal_scale_num=2, operations=None):
         super().__init__()
         operations = operations or nn
+        self.temporal_scale_num = temporal_scale_num
         self.conv_in = init_causal_conv3d(in_channels, block_out_channels[0], 3, padding=1, operations=operations)
+        num_blocks = len(block_out_channels)
+        temporal_down_flags = [
+            i >= num_blocks - temporal_scale_num - 1
+            for i in range(num_blocks)
+        ]
+
         self.down_blocks = nn.ModuleList([
-            DownEncoderBlock3D(block_out_channels[0], block_out_channels[0], add_downsample=True, first=True, groups=norm_num_groups, operations=operations),
-            DownEncoderBlock3D(block_out_channels[0], block_out_channels[1], add_downsample=True, groups=norm_num_groups, operations=operations),
-            DownEncoderBlock3D(block_out_channels[1], block_out_channels[2], add_downsample=True, groups=norm_num_groups, operations=operations),
-            DownEncoderBlock3D(block_out_channels[2], block_out_channels[3], add_downsample=False, groups=norm_num_groups, operations=operations),
+            DownEncoderBlock3D(block_out_channels[0], block_out_channels[0], add_downsample=True, first=True, temporal_down=temporal_down_flags[0], groups=norm_num_groups, operations=operations),
+            DownEncoderBlock3D(block_out_channels[0], block_out_channels[1], add_downsample=True, temporal_down=temporal_down_flags[1], groups=norm_num_groups, operations=operations),
+            DownEncoderBlock3D(block_out_channels[1], block_out_channels[2], add_downsample=True, temporal_down=temporal_down_flags[2], groups=norm_num_groups, operations=operations),
+            DownEncoderBlock3D(block_out_channels[2], block_out_channels[3], add_downsample=False, temporal_down=temporal_down_flags[3], groups=norm_num_groups, operations=operations),
         ])
         self.mid_block = UNetMidBlock3D(block_out_channels[-1], groups=norm_num_groups, operations=operations)
         self.conv_norm_out = operations.GroupNorm(_resolve_groups(block_out_channels[-1], norm_num_groups), block_out_channels[-1])
@@ -257,7 +283,7 @@ class Decoder3D(nn.Module):
 class VideoAutoencoderKL(nn.Module):
     def __init__(self, in_channels=3, out_channels=3, block_out_channels=(128, 256, 512, 512), latent_channels=16, norm_num_groups=32, temporal_scale_num=2, operations=None, **kwargs):
         super().__init__()
-        self.encoder = Encoder3D(in_channels=in_channels, block_out_channels=block_out_channels, latent_channels=latent_channels, norm_num_groups=norm_num_groups, operations=operations)
+        self.encoder = Encoder3D(in_channels=in_channels, block_out_channels=block_out_channels, latent_channels=latent_channels, norm_num_groups=norm_num_groups, temporal_scale_num=temporal_scale_num, operations=operations)
         self.decoder = Decoder3D(out_channels=out_channels, block_out_channels=block_out_channels, latent_channels=latent_channels, norm_num_groups=norm_num_groups, temporal_scale_num=temporal_scale_num, operations=operations)
 
     def encode_distribution(self, x, **kwargs):
@@ -272,7 +298,8 @@ class VideoAutoencoderKL(nn.Module):
 
     def forward(self, sample, sample_posterior=False, generator=None, **kwargs):
         z = self.encode(sample, sample_posterior=sample_posterior, generator=generator, **kwargs)
-        return self.decode(z)
+        decoded = self.decode(z)
+        return decoded[:, :, :sample.shape[2], :sample.shape[3], :sample.shape[4]]
 
 
 class VideoAutoencoderKLWrapper(VideoAutoencoderKL):
